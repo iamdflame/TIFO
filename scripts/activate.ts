@@ -23,7 +23,7 @@ import {
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import nacl from 'tweetnacl';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,6 +44,7 @@ const NETWORK = opt('network', 'devnet') as 'mainnet' | 'devnet';
 const LEVEL = Number(opt('level', '1'));      // mainnet: 1 = 60s delay, 12 = real-time
 const WEEKS = Number(opt('weeks', '4'));
 const KEYPAIR_PATH = opt('keypair', path.join(ROOT, 'keys', `tifo-${NETWORK}.keypair.json`));
+const RESUME_TXSIG = opt('txsig', '');        // resume activation with an already-confirmed subscribe tx
 
 const CONFIG = {
   mainnet: {
@@ -91,6 +92,39 @@ async function main() {
     process.exit(1);
   }
 
+  /** Confirm via HTTP polling — websocket subscriptions are blocked in many dev environments. */
+  const confirmByPolling = async (sig: string, label: string): Promise<boolean> => {
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 2_000));
+      const st = (await connection.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+      if (st) {
+        if (st.err) throw new Error(`${label} failed on-chain: ${JSON.stringify(st.err)}`);
+        if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') return true;
+      }
+    }
+    return false;
+  };
+
+  /** Send with a priority fee, retrying with a fresh blockhash if it expires. */
+  const sendWithRetry = async (instructions: Transaction['instructions'], label: string): Promise<string> => {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const tx = new Transaction().add(
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+        ...instructions,
+      );
+      const bh = await connection.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = bh.blockhash;
+      tx.feePayer = keypair.publicKey;
+      tx.sign(keypair);
+      const sig = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 5 });
+      console.log(`  ${label}: sent ${sig} — polling for confirmation…`);
+      if (await confirmByPolling(sig, label)) return sig;
+      console.log(`  ${label}: not confirmed in time (attempt ${attempt}/4) — retrying…`);
+    }
+    throw new Error(`${label}: exhausted retries`);
+  };
+
   // 2. anchor program (patch IDL address so one IDL layout serves both networks)
   const idl = JSON.parse(fs.readFileSync(path.join(__dirname, 'idl', CONFIG.idl), 'utf8'));
   idl.address = CONFIG.programId;
@@ -109,42 +143,44 @@ async function main() {
   const ataInfo = await connection.getAccountInfo(userTokenAccount);
   if (!ataInfo) {
     console.log('creating TxL token account (one-time rent)…');
-    const tx = new Transaction().add(
+    await sendWithRetry([
       createAssociatedTokenAccountInstruction(
         keypair.publicKey, userTokenAccount, keypair.publicKey, tokenMint,
         TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
       ),
-    );
-    await anchor.web3.sendAndConfirmTransaction(connection, tx, [keypair], { commitment: 'confirmed' });
+    ], 'create ATA');
     for (let i = 0; i < 5; i++) {
       try { await getAccount(connection, userTokenAccount, 'confirmed', TOKEN_2022_PROGRAM_ID); break; }
       catch { await new Promise(r => setTimeout(r, 2_000)); }
     }
   }
 
-  // 3. on-chain subscribe
-  console.log(`subscribing on-chain: level ${LEVEL}, ${WEEKS} weeks…`);
-  const subTx: Transaction = await (program.methods as any)
-    .subscribe(LEVEL, WEEKS)
-    .accounts({
-      user: keypair.publicKey,
-      pricingMatrix: pricingMatrixPda,
-      tokenMint,
-      userTokenAccount,
-      tokenTreasuryVault,
-      tokenTreasuryPda,
-      tokenProgram: TOKEN_2022_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-      systemProgram: SystemProgram.programId,
-    })
-    .transaction();
+  // 3. on-chain subscribe (or resume with an already-confirmed signature)
+  let txSig: string;
+  if (RESUME_TXSIG) {
+    console.log(`resuming with existing subscribe tx: ${RESUME_TXSIG}`);
+    const st = (await connection.getSignatureStatuses([RESUME_TXSIG], { searchTransactionHistory: true })).value[0];
+    if (!st || st.err) throw new Error(`provided txsig not found or failed on-chain: ${JSON.stringify(st?.err ?? 'not found')}`);
+    txSig = RESUME_TXSIG;
+  } else {
+    console.log(`subscribing on-chain: level ${LEVEL}, ${WEEKS} weeks…`);
+    const subTx: Transaction = await (program.methods as any)
+      .subscribe(LEVEL, WEEKS)
+      .accounts({
+        user: keypair.publicKey,
+        pricingMatrix: pricingMatrixPda,
+        tokenMint,
+        userTokenAccount,
+        tokenTreasuryVault,
+        tokenTreasuryPda,
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .transaction();
 
-  const bh = await connection.getLatestBlockhash('confirmed');
-  subTx.recentBlockhash = bh.blockhash;
-  subTx.feePayer = keypair.publicKey;
-  subTx.sign(keypair);
-  const txSig = await connection.sendRawTransaction(subTx.serialize());
-  await connection.confirmTransaction({ signature: txSig, ...bh }, 'confirmed');
+    txSig = await sendWithRetry(subTx.instructions, 'subscribe');
+  }
   console.log(`subscribe confirmed: ${txSig}`);
   console.log(`explorer: https://explorer.solana.com/tx/${txSig}${NETWORK === 'devnet' ? '?cluster=devnet' : ''}`);
 
@@ -162,10 +198,17 @@ async function main() {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwt}` },
     body: JSON.stringify({ txSig, walletSignature, leagues: SELECTED_LEAGUES }),
   });
-  const actBody = await actRes.json().catch(() => null) as { token?: string } | string | null;
-  if (!actRes.ok) throw new Error(`token/activate -> ${actRes.status}: ${JSON.stringify(actBody)}`);
-  const apiToken = typeof actBody === 'string' ? actBody : actBody?.token;
-  if (!apiToken) throw new Error(`activation returned no token: ${JSON.stringify(actBody)}`);
+  const actText = await actRes.text();
+  if (!actRes.ok) throw new Error(`token/activate -> ${actRes.status}: ${actText}`);
+  // token may arrive as plain text or as JSON {token}
+  let apiToken: string | undefined;
+  try {
+    const j = JSON.parse(actText) as { token?: string; apiToken?: string } | string;
+    apiToken = typeof j === 'string' ? j : j?.token ?? j?.apiToken;
+  } catch {
+    apiToken = actText.trim() || undefined;
+  }
+  if (!apiToken) throw new Error(`activation returned no token: ${actText.slice(0, 200)}`);
 
   // write .env
   const envPath = path.join(ROOT, '.env');
